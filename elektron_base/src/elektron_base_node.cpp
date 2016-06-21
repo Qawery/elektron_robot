@@ -13,7 +13,8 @@
 Spis treści:
 -definicje, zmienne i obiekty globalne
 -ReadDeviceVitals	-konstruowanie polecenia przesłania danych przez sterownik napędów.
--VelocityCommandCallback	-obsługa wiadomości przychodzących na topic.
+-AbsoluteVelocityCommandCallback	-obsługa wiadomości przychodzących na topic "cmd_vel_absolute".
+-RelativeVelocityCommandCallback	-obsługa wiadomości przychodzących na topic "cmd_vel_relative".
 -IncomingDataListener	-nasłuchiwanie na dane przychodzące od sterownika napędów.
 -TimeoutCheck	-zabezpieczenie na brak nowych poleceń.
 -SendOrders	-wysyłanie poleceń do sterownika napędów.
@@ -27,31 +28,39 @@ Spis treści:
 #define DEFAULT_DRIVES_DRIVER_ADDRESS "/dev/ttyUSB0"
 #define DEFAULT_SEND_LOOP_EXECUTE_RATE_VALUE 200
 #define DEFAULT_READ_DEVICE_VITALS_RATE_VALUE 10
+
 #define DEFAULT_AXLE_LENGTH 0.314
-#define DEFAULT_ENCODER_TICKS 5000
+#define DEFAULT_ENCODER_IMPULSES 20000
 #define DEFAULT_WHEEL_DIAMETER 0.1
 #define DEFAULT_REGULATOR_RATE 100
+#define DEFAULT_MAX_LINEAR_SPEED 0,254
+#define DEFAULT_MAX_ANGULAR_SPEED 0,87
+
 #define DEFAULT_COMMAND_TIMEOUT_TIME 3
 #define DEFAULT_TIMEOUT_COMMAND_SEND_TIME 1
+
 #define DEFAULT_PUBLISH_ODOMETRY_TF true
 
 //Parametry robota i sterownika, pobierane z launchfile.
 std::string drivesDriverAddress;	//Adres płytki sterownika silników.
-double sendLoopExecuteRateValue;	//Częstotliwość wywoływania pętli wysyłania poleceń do płytki.
-double readDeviceVitalsRateValue;	//Częstotliwość konstruowania się polecenia przesłania danych przez płytkę.
+double sendLoopExecuteRateValue;	//Częstotliwość wywoływania pętli wysyłania poleceń do płytki [Hz].
+double readDeviceVitalsRateValue;	//Częstotliwość konstruowania się polecenia przesłania danych przez płytkę [Hz].
 double axleLength;	//Długość osi robota [m].
-double encoderTicks;	//Ilość tick'ów enkodera uzyskanych w jednym obrocie koła (Impulsów będzie 4 razy tyle).
+double encoderImpulses;	//Ilość impulsów enkodera uzyskanych w jednym obrocie koła (Tick'ów będzie mniej).
 double wheelDiameter;	//Średnica koła robota [m].
 double regulatorRate;	//Częstotliwość pracy regulatora [Hz].
-double commandTimeoutTime;	//Czas po którym następuje zatrzymanie silników w przypadku braku otrzymania nowego polecenie prędkości.
-double timeoutCommandSendTime;	//Czas co który następuje wysyłanie polecenia zatrzymania silników przez timeout.
+double maxLinearSpeed;	//Maksymalna prędkość liniowa robota [m/s];
+double maxAngularSpeed;	//Maksymalna prędkość kątowa robota [rad/s];
+double commandTimeoutTime;	//Czas po którym następuje zatrzymanie silników w przypadku braku otrzymania nowego polecenie prędkości [s].
+double timeoutCommandSendTime;	//Czas co który następuje wysyłanie polecenia zatrzymania silników przez timeout [s].
 
 //Obiekty do komunikacji i pomocnicze.
 pthread_t listenerThread;	//Wątek zbierający dane przychodzące od płytki.
 ros::Timer* readDeviceVitalsRate;	//Zegar dodający polecenie podania danych z płytki.
 ros::NodeHandle* nodeHandlePublic;	//Node handle z nazwą w przestrzeni publicznej
 ros::NodeHandle* nodeHandlePrivate;	//Node handle z nazwą w przestrzeni prywatnej
-ros::Subscriber* velocitySubscriber;	//Subscriber odbierający polecenia sterowania prędkością przychodzące na topic.
+ros::Subscriber* absoluteVelocitySubscriber;	//Subscriber odbierający polecenia sterowania prędkością przychodzące na topic "cmd_vel_absolute".
+ros::Subscriber* relativeVelocitySubscriber;	//Subscriber odbierający polecenia sterowania prędkością przychodzące na topic "cmd_vel_relative".
 
 //Obiekty i struktury biblioteki NFv2
 NF_STRUCT_ComBuf NFCommunicationBuffer;	//Bufor komunikacyjny biblioteki NFv2.
@@ -83,13 +92,13 @@ double delta_l=0;	//Zmiana ilości impulsów lewego koła.
 double delta_r=0;	//Zmiana ilości impulsów prawego koła.
 double r_pos_total_now=0;	//Aktualna przeliczona pozycja kola prawego w SI [m].
 double l_pos_total_now=0;	//Aktualna przeliczona pozycja kola lewego w SI [m].
-uint32_t r_pos_total=0;		//Aktualna pobrana pozycja kola prawego.
+uint32_t r_pos_total=0;	//Aktualna pobrana pozycja kola prawego.
 uint32_t l_pos_total=0; 	//Aktualna pobrana pozycja kola lewego.
 double r_pos_total_old=0;	//Poprzednia zbiorcza pozycja kola prawego.
 double l_pos_total_old=0; 	//Poprzednia zbiorcza pozycja kola lewego.
 ros::Time last_time(0);		//Moment ostatniego pomiaru.
 ros::Time current_time(0);	//Aktualny moment pomiaru.
-bool publishOdometryTF;		//Czy publikować odomoetrię na TF.
+bool publishOdometryTF;		//Czy publikować odometrię na TF.
 bool firstOdometryCalculation = true;	//Czy jest to pierwsze przejście obliczania odometrii.
 
 //Globalne zmienne pomocnicze programu.
@@ -118,16 +127,66 @@ void ReadDeviceVitals(const ros::TimerEvent&)
 
 /**
 	Odbiera wiadomość z topic'a i wylicza zadane prędkości dla silników.
+	Wiadomość zawiera zadaną prędkość robota w [m/s].
 	Uruchamiany w wyniku otrzymania wiadomości na topic.
 */
-void VelocityCommandCallback(const geometry_msgs::TwistConstPtr& msg) 
+void AbsoluteVelocityCommandCallback(const geometry_msgs::TwistConstPtr& msg) 
 {
-	//Wyliczenie proporcji skretu do ruchu postepowego.
-	double rotation = msg->angular.z * axleLength / 2.0;
+	//Sprawdzenie czy przekraczamy maksymalną prędkość robota.
+	if(msg->linear.x < -maxLinearSpeed || msg->linear.x > maxLinearSpeed)
+	{
+		ROS_INFO("Exceding robot max linear speed. Speed: %f; Max: %f", msg->linear.x, maxLinearSpeed);
+	}
 
-	//Wyliczenie predkosci poszczegolnych kol.
-	double 	leftWheelVelocity = ((msg->linear.x - rotation) * encoderTicks) / (2 * 3.14 * wheelDiameter * regulatorRate);
-	double	rightWheelVelocity = ((msg->linear.x + rotation) * encoderTicks) / (2 * 3.14 * wheelDiameter * regulatorRate);
+	if(msg->angular.z < -maxAngularSpeed || msg->angular.z > maxAngularSpeed)
+	{
+		ROS_INFO("Exceding robot max angular speed. Speed: %f; Max: %f", msg->linear.z, maxAngularSpeed);
+	}	
+	
+	//Wyliczenie współczynnika prędkości kątowej.
+	double angular = msg->angular.z * axleLength / 2.0;
+
+	//Wyliczenie predkosci liniowej kol. Przeliczenie z [m/s] na [impulsy_enkodera/cykl_sterownika].
+	double leftWheelVelocity = ((msg->linear.x - angular) * encoderImpulses) / (2 * 3.14 * (wheelDiameter / 2) * regulatorRate);
+	double rightWheelVelocity = ((msg->linear.x + angular) * encoderImpulses) / (2 * 3.14 * (wheelDiameter / 2) * regulatorRate);
+
+	std::lock_guard<std::mutex> lock(commandArrayMutex);
+	NFCommunicationBuffer.SetDrivesSpeed.data[0] = leftWheelVelocity;
+	NFCommunicationBuffer.SetDrivesSpeed.data[1] = rightWheelVelocity;
+	
+	NFCommunicationBuffer.SetDrivesMode.data[0] = NF_DrivesMode_SPEED;
+	NFCommunicationBuffer.SetDrivesMode.data[1] = NF_DrivesMode_SPEED;
+	
+	commandTimeoutCounter = 0;	//Zerowanie licznika po otrzymaniu polecenia.
+	timeoutCommandCooldown = 0;	
+	drivesCommandChange = true;	
+}
+
+
+/**
+	Odbiera wiadomość z topic'a i wylicza zadane prędkości dla silników.
+	Wiadomość zawiera zadaną prędkość robota jako ułamek maksymalnej prędkości robota.
+	Uruchamiany w wyniku otrzymania wiadomości na topic.
+*/
+void RelativeVelocityCommandCallback(const geometry_msgs::TwistConstPtr& msg) 
+{
+	//Sprawdzenie czy przekraczamy maksymalną prędkość robota.
+	if((msg->linear.x * maxLinearSpeed) < -maxLinearSpeed || (msg->linear.x * maxLinearSpeed) > maxLinearSpeed)
+	{
+		ROS_INFO("Exceding robot max linear speed. Speed: %f; Max: %f", (msg->linear.x * maxLinearSpeed), maxLinearSpeed);
+	}
+
+	if((msg->angular.z * maxAngularSpeed) < -maxAngularSpeed || (msg->angular.z * maxAngularSpeed) > maxAngularSpeed)
+	{
+		ROS_INFO("Exceding robot max angular speed. Speed: %f; Max: %f", (msg->linear.z * maxAngularSpeed), maxAngularSpeed);
+	}
+
+	//Wyliczenie współczynnika prędkości kątowej.
+	double angular = (msg->angular.z * maxAngularSpeed) * axleLength / 2.0;
+
+	//Wyliczenie predkosci liniowej kol. Przeliczenie z [m/s] na [impulsy_enkodera/cykl_sterownika].
+	double leftWheelVelocity = (((msg->linear.x * maxLinearSpeed) - angular) * encoderImpulses) / (2 * 3.14 * (wheelDiameter / 2) * regulatorRate);
+	double rightWheelVelocity = (((msg->linear.x * maxLinearSpeed) + angular) * encoderImpulses) / (2 * 3.14 * (wheelDiameter / 2) * regulatorRate);
 
 	std::lock_guard<std::mutex> lock(commandArrayMutex);
 	NFCommunicationBuffer.SetDrivesSpeed.data[0] = leftWheelVelocity;
@@ -349,15 +408,16 @@ bool Initialization(int argc, char** argv)
 		readDeviceVitalsRateValue = DEFAULT_READ_DEVICE_VITALS_RATE_VALUE;
 		ROS_INFO("Using default readDeviceVitalsRateValue value: %f.", readDeviceVitalsRateValue);
 	}
+
 	if (!nodeHandlePrivate->getParam("axleLength", axleLength)) 
 	{
 		axleLength = DEFAULT_AXLE_LENGTH;
 		ROS_INFO("Using default axleLength value: %f.", axleLength);
 	}
-	if (!nodeHandlePrivate->getParam("encoderTicks", encoderTicks)) 
+	if (!nodeHandlePrivate->getParam("encoderImpulses", encoderImpulses)) 
 	{
-		encoderTicks = DEFAULT_ENCODER_TICKS;
-		ROS_INFO("Using default encoderTicks value: %f.", encoderTicks);
+		encoderImpulses = DEFAULT_ENCODER_IMPULSES;
+		ROS_INFO("Using default encoderImpulses value: %f.", encoderImpulses);
 	}
 	if (!nodeHandlePrivate->getParam("wheelDiameter", wheelDiameter)) 
 	{
@@ -369,6 +429,17 @@ bool Initialization(int argc, char** argv)
 		regulatorRate = DEFAULT_REGULATOR_RATE;
 		ROS_INFO("Using default regulatorRate value: %f.", regulatorRate);
 	}
+	if (!nodeHandlePrivate->getParam("maxLinearSpeed", maxLinearSpeed)) 
+	{
+		maxLinearSpeed = DEFAULT_MAX_LINEAR_SPEED;
+		ROS_INFO("Using default maxLinearSpeed value: %f.", maxLinearSpeed);
+	}
+	if (!nodeHandlePrivate->getParam("maxAngularSpeed", maxAngularSpeed)) 
+	{
+		maxAngularSpeed = DEFAULT_MAX_ANGULAR_SPEED;
+		ROS_INFO("Using default maxAngularSpeed value: %f.", maxAngularSpeed);
+	}
+
 	if (!nodeHandlePrivate->getParam("commandTimeoutTime", commandTimeoutTime)) 
 	{
 		commandTimeoutTime = DEFAULT_COMMAND_TIMEOUT_TIME;
@@ -379,6 +450,7 @@ bool Initialization(int argc, char** argv)
 		timeoutCommandSendTime = DEFAULT_TIMEOUT_COMMAND_SEND_TIME;
 		ROS_INFO("Using default timeoutCommandSendTime value: %f.", timeoutCommandSendTime);
 	}
+
 	if (!nodeHandlePrivate->getParam("publishOdometryTF", publishOdometryTF)) 
 	{
 		publishOdometryTF = DEFAULT_PUBLISH_ODOMETRY_TF;
@@ -404,7 +476,8 @@ bool Initialization(int argc, char** argv)
 	odometryTransform->header.frame_id = "odom";
 	odometryTransform->child_frame_id = "base_link";	
 
-	velocitySubscriber = new ros::Subscriber(nodeHandlePublic->subscribe("cmd_vel", 1, &VelocityCommandCallback));
+	absoluteVelocitySubscriber = new ros::Subscriber(nodeHandlePublic->subscribe("cmd_vel_absolute", 1, &AbsoluteVelocityCommandCallback));
+	relativeVelocitySubscriber = new ros::Subscriber(nodeHandlePublic->subscribe("cmd_vel_relative", 1, &RelativeVelocityCommandCallback));
 
 	if(pthread_create(&listenerThread, NULL, &IncomingDataListener, NULL))
 	{
@@ -428,7 +501,8 @@ void Finish()
 	delete odometryMessage;
 	delete odometryTransform;
 	delete readDeviceVitalsRate;
-	delete velocitySubscriber;
+	delete absoluteVelocitySubscriber;
+	delete relativeVelocitySubscriber;
 	delete nodeHandlePublic;
 	delete nodeHandlePrivate;
 }
